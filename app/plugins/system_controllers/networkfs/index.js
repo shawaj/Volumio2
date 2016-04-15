@@ -3,10 +3,13 @@
 var libQ = require('kew');
 var fs = require('fs-extra');
 var exec = require('child_process').exec;
+var execSync = require('child_process').execSync;
 var config = new (require('v-conf'))();
-var mountutil = require('linux-mountutils');
 var libUUID = require('node-uuid');
 var S = require('string');
+var self = this;
+
+//Some functions of this plugin are taken from mw-white's Mount-utils  https://github.com/mw-white/node-linux-mountutils
 
 // Define the ControllerNetworkfs class
 module.exports = ControllerNetworkfs;
@@ -65,27 +68,6 @@ ControllerNetworkfs.prototype.getUIConfig = function () {
 	var self = this;
 
 	var uiconf = fs.readJsonSync(__dirname + '/UIConfig.json');
-
-	/*var name=config.get('NasMounts.Flac.name');
-	 var ip=config.get('NasMounts.Flac.ip');
-	 var fstype=config.get('NasMounts.Flac.fstype');
-
-	 uiconf.sections[0].content[0].value=name;
-	 uiconf.sections[0].content[1].value=ip;
-	 uiconf.sections[0].content[2].value.value=fstype;
-	 uiconf.sections[0].content[2].label.value=fstype;
-
-	 var user=config.get('NasMounts.Flac.user');
-	 if(user!=undefined)
-	 uiconf.sections[0].content[3].value=user;
-
-	 var password=config.get('NasMounts.Flac.password');
-	 if(password!=undefined)
-	 uiconf.sections[0].content[4].value=password;
-
-	 var options=config.get('NasMounts.Flac.options');
-	 if(options!=undefined)
-	 uiconf.sections[0].content[5].value=options;*/
 
 	return uiconf;
 };
@@ -147,6 +129,7 @@ ControllerNetworkfs.prototype.mountShare = function (shareid) {
 
 	var sharename = config.get('NasMounts.' + shareid + '.name');
 	var fstype = config.get('NasMounts.' + shareid + '.fstype');
+	var options = config.get('NasMounts.' + shareid + '.options');
 	var pointer;
 	var fsopts;
 	var credentials;
@@ -160,19 +143,27 @@ ControllerNetworkfs.prototype.mountShare = function (shareid) {
 			credentials = 'guest,';
 		}
 		fsopts = credentials + "dir_mode=0777,file_mode=0666,iocharset=utf8,noauto";
+		if (options !== 'undefined' && options !== '') {
+			fsopts = fsopts + "," + options;
+		}
 	} else { // nfs
 		pointer = config.get('NasMounts.' + shareid + '.ip') + ':' + config.get('NasMounts.' + shareid + '.path');
 	}
 
 	var mountpoint = '/mnt/NAS/' + config.get('NasMounts.' + shareid + '.name');
 
-	mountutil.mount(pointer, mountpoint, {"createDir": true, "fstype": fstype, "fsopts": fsopts}, function (result) {
+	mount(pointer, mountpoint, {"createDir": true, "fstype": fstype, "fsopts": fsopts}, function (result) {
+
 		if (result.error) {
+			var splitted = result.error.split(':');
+			var error = splitted.slice(-1)[0];
+			console.log('ERRRRRRRRRRRR------------------------------' + error );
 			// Something went wrong!
-			defer.reject(new Error("Cannot mount share"));
-			self.context.coreCommand.pushConsoleMessage('[' + Date.now() + '] Error Mounting Share ' + sharename + ': ' + result.error);
-			self.context.coreCommand.pushToastMessage('alert', "Music Library", 'Error adding Network Share: ' + result.error);
+			defer.reject(new Error('Cannot mount share'  + sharename + ':  ' + error));
+			self.context.coreCommand.pushConsoleMessage('[' + Date.now() + '] Error Mounting Share ' + sharename + ': ' + error);
+			self.context.coreCommand.pushToastMessage('alert', "Music Library", 'Error adding Network Share: ' + error);
 		} else {
+			console.log('----------------------------------------------NO ERROR');
 			self.context.coreCommand.pushConsoleMessage('[' + Date.now() + ']' + sharename + ' Share Mounted Successfully');
 			self.context.coreCommand.pushToastMessage('success', "Music Library", 'Network Share Successfully added ');
 			defer.resolve({});
@@ -470,12 +461,13 @@ ControllerNetworkfs.prototype.listShares = function (data) {
 };
 
 ControllerNetworkfs.prototype.getMountSize = function (share) {
+	var self = this;
 	return new Promise(function (resolve, reject) {
 		var realsize = '';
 		var key = 'NasMounts.' + share + '.';
 		var name = config.get(key + 'name');
 		var mountpoint = '/mnt/NAS/' + name;
-		var mounted = mountutil.isMounted(mountpoint, false);
+		var mounted = self.isMounted(mountpoint, false);
 		var respShare = {
 			path: config.get(key + 'path'),
 			ip: config.get(key + 'ip'),
@@ -575,7 +567,7 @@ ControllerNetworkfs.prototype.editShare = function (data) {
 
 	if (config.has('NasMounts.' + data['id'])) {
 		var mountpoint = '/mnt/NAS/' + config.get('NasMounts.' + data['id'] + '.name');
-		mountutil.umount(mountpoint, false, {"removeDir": true}, function (result) {
+		umount(mountpoint, false, {"removeDir": true}, function (result) {
 			if (result.error) {
 				defer.resolve({
 					success: false,
@@ -638,3 +630,116 @@ ControllerNetworkfs.prototype.editShare = function (data) {
 
 	return defer.promise;
 };
+
+
+// Mount-utils
+
+var isMounted = function(path, isDevice) {
+	// Sanity checks - if we're looking for a filesystem path that doesn't
+	// exist, it's probably not mounted...
+	if (!isDevice && !fs.existsSync(path)) {
+		return({"mounted": false, "error": "Path does not exist"});
+	}
+	// Need mtab to check existing mounts
+	if (!fs.existsSync("/etc/mtab")) {
+		return({"mounted": false, "error": "Can't read mtab"});
+	}
+
+	var mtab = fs.readFileSync("/etc/mtab", { 'encoding': 'ascii' }).split("\n");
+	// Interate through and find the one we're looking for
+	for (var i in mtab) {
+		var mountDetail = mtab[i].split(" ");
+		// Does the appropriate field match?  Exact match only.
+		if ((isDevice && (mountDetail[0]==path)) || (!isDevice && (mountDetail[1]==path))) {
+			return({
+				"mounted": true,
+				"device": mountDetail[0],
+				"mountpoint": mountDetail[1],
+				"fstype": mountDetail[2],
+				"fsopts": mountDetail[3]
+			});
+		}
+	}
+	// Didn't find it
+	return({"mounted":false});
+}
+
+var mount = function(dev, path, options, callback) {
+	// See if there is already something mounted at the path
+	var mountInfo = isMounted(path,false);
+	if (mountInfo.mounted) {
+		callback({"error": "Something is already mounted on " + path});
+		return;
+	}
+
+	// See if the mountpoint exists.  If not, do we create?
+	if (!fs.existsSync(path)) {
+		if (options.createDir) {
+			var mode = "0777";
+			if (options.dirMode) {
+				mode = options.dirMode;
+			}
+			fs.mkdirSync(path,mode);
+		} else {
+			callback({"error": "Mount directory does not exist"});
+			return;
+		}
+	}
+	// Make sure mountpoint is a directory
+	if (!fs.statSync(path).isDirectory()) {
+		callback({"error": "Mountpoint is not a directory"});
+		return;
+	}
+
+	// Build the command line
+	var cmd = (options.noSudo?"":
+		(options.sudoPath?options.sudoPath:"/usr/bin/sudo")+" ") +
+		(options.mountPath?options.mountPath:"/bin/mount") + " " +
+		(options.readonly?"-r ":"") +
+		(options.fstype?"-t " + options.fstype + " ":"") +
+		(options.fsopts?"-o " + options.fsopts + " ":"") +
+		dev + " " + path;
+
+	// Let's do it!
+	var mountProc = try {
+		execSync(cmd, function(error, stdout, stderr) {
+		if (error !== null) {
+			callback({ "error": "exec error " + error });
+		} else {
+			callback({ "OK": true });
+		}
+		}
+	} catch(e) {
+		console.log(e);
+	} //readFileSync will fail until file exists
+	});
+}
+
+var umount = function(path, isDevice, options, callback) {
+	// See if it's mounted
+	var mountInfo = this.isMounted(path,isDevice);
+	if (!mountInfo.mounted) {
+		callback({"OK": true});
+		return;
+	}
+
+	// Build the command line
+	var cmd = (options.noSudo?"":
+		(options.sudoPath?options.sudoPath:"/usr/bin/sudo")+" ") +
+		(options.umountPath?options.umountPath:"/bin/umount") + " " + path;
+
+	// Let's do it!
+	var umountProc = exec(cmd, function(error, stdout, stderr) {
+		if (error !== null) {
+			callback({ "error": "exec error " + error });
+		} else {
+			// Remove the mountpoint if the option was given
+			if (options.removeDir) {
+				fs.rmdirSync(mountInfo.mountpoint);
+			}
+			callback({ "OK": true });
+		}
+	});
+}
+
+//var ethspeed = execSync("/usr/bin/sudo /sbin/ethtool eth0 | grep -i speed | tr -d 'Speed:' | xargs", { encoding: 'utf8' });
